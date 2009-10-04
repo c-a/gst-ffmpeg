@@ -1060,6 +1060,9 @@ gst_ffmpegdec_vdpau_alloc_output_buffer (GstFFMpegDec * ffmpegdec,
   if (G_UNLIKELY (ret != GST_FLOW_OK))
     goto alloc_failed;
 
+  if (G_UNLIKELY (!GST_IS_VDP_VIDEO_BUFFER (*outbuf)))
+    goto wrong_buffer;
+
   if (G_UNLIKELY (!ffmpegdec->device))
     ffmpegdec->device = g_object_ref (((GstVdpVideoBuffer *) * outbuf)->device);
 
@@ -1075,6 +1078,11 @@ alloc_failed:
   {
     GST_ERROR_OBJECT (ffmpegdec, "pad_alloc failed");
     return ret;
+  }
+wrong_buffer:
+  {
+    GST_ERROR_OBJECT (ffmpegdec, "sink element returned wrong kindof buffer");
+    return GST_FLOW_NOT_LINKED;
   }
 }
 
