@@ -394,6 +394,44 @@ if test x$HAVE_FFMPEG_UNINSTALLED = x1; then
 fi
 AM_CONDITIONAL(HAVE_FFMPEG_UNINSTALLED, test x$HAVE_FFMPEG_UNINSTALLED = x1)
 
+PKG_CHECK_MODULES(VDPAU, vdpau, [HAVE_VDPAU="yes"],
+[
+    AC_CHECK_HEADER([vdpau/vdpau.h], [HAVE_VDPAU_H=yes],
+    [
+      dnl Didn't find VDPAU header straight away.
+      dnl Try /usr/include/nvidia. Need to clear caching vars first
+      AC_MSG_NOTICE([VDPAU header not in standard path. Checking /usr/include/nvidia])
+      unset ac_cv_header_vdpau_vdpau_h
+      unset ac_cv_header_vdpau_vdpau_x11_h
+      VDPAU_CFLAGS="-I/usr/include/nvidia"
+      VDPAU_LIBS="-L/usr/lib/nvidia -lvdpau"
+      saved_CPPFLAGS="$CPPFLAGS"
+      CPPFLAGS="$VDPAU_CFLAGS $saved_CPPFLAGS"
+      AC_CHECK_HEADER([vdpau/vdpau.h], [HAVE_VDPAU_H=yes])
+      CPPFLAGS="$saved_CPPFLAGS"
+    ])
+    
+    AC_CHECK_HEADER([vdpau/vdpau_x11.h], [HAVE_VDPAU_X11_H=yes])
+    if test "x$HAVE_VDPAU_H" = "xyes" -a "x$HAVE_VDPAU_X11_H" = "xyes"; then
+      dnl Found the headers - look for the lib
+      AC_MSG_NOTICE([VDPAU headers found. Checking libraries])
+      saved_LIBS="$LIBS"
+      LIBS="$VDPAU_LIBS $saved_LIBS"
+      AC_CHECK_LIB(vdpau,vdp_device_create_x11,[HAVE_VDPAU="yes"])
+      LIBS="$saved_LIBS"
+    fi
+])
+
+if test "x$HAVE_VDPAU" = "xyes"; then
+  AC_MSG_NOTICE([Found up to date VDPAU installation])
+  
+  VDPAU_LIBS="-lgstvdp-0.10 $VDPAU_LIBS"
+  AC_SUBST(VDPAU_CFLAGS)
+  AC_SUBST(VDPAU_LIBS)
+  AC_DEFINE([HAVE_VDPAU], [1], ["asdasd"])
+  embffmpeg_configure_args="$embffmpeg_configure_args --enable-vdpau"
+fi
+
 AC_CONFIG_FILES(
 Makefile
 common/Makefile

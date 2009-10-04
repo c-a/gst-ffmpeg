@@ -30,6 +30,13 @@
 #include <libavcodec/avcodec.h>
 #endif
 
+#ifdef HAVE_VDPAU
+#include <gst/vdpau/gstvdpdevice.h>
+#include <gst/vdpau/gstvdpvideobuffer.h>
+#include <vdpau/vdpau.h>
+#include "libavcodec/vdpau.h"
+#endif
+
 #include <gst/gst.h>
 #include <gst/video/video.h>
 
@@ -164,6 +171,13 @@ struct _GstFFMpegDec
 
   /* Can downstream allocate 16bytes aligned data. */
   gboolean can_allocate_aligned;
+
+#ifdef HAVE_VDPAU
+  gboolean is_vdpau_dec;
+  GstVdpDevice *device;
+  VdpDecoder decoder;
+  gint decoder_max_refs;
+#endif
 };
 
 typedef struct _GstFFMpegDecClass GstFFMpegDecClass;
@@ -229,6 +243,11 @@ static void gst_ffmpegdec_get_property (GObject * object,
 
 static gboolean gst_ffmpegdec_negotiate (GstFFMpegDec * ffmpegdec,
     gboolean force);
+
+#ifdef HAVE_VDPAU
+static void gst_ffmpegdec_draw_horiz_band (AVCodecContext * context,
+    const AVFrame * picture, int offset[4], int y, int type, int height);
+#endif
 
 /* some sort of bufferpool handling, but different */
 static int gst_ffmpegdec_get_buffer (AVCodecContext * context,
@@ -323,11 +342,15 @@ gst_ffmpegdec_base_init (GstFFMpegDecClass * klass)
   /* get the caps */
   sinkcaps = gst_ffmpeg_codecid_to_caps (in_plugin->id, NULL, FALSE);
   if (!sinkcaps) {
-    GST_DEBUG ("Couldn't get sink caps for decoder '%s'", in_plugin->name);
-    sinkcaps = gst_caps_from_string ("unknown/unknown");
+    GST_DEBUG ("Couldn't get sink caps for decoder '%s', skipping codec",
+        in_plugin->name);
+    goto next;
   }
   if (in_plugin->type == CODEC_TYPE_VIDEO) {
-    srccaps = gst_caps_from_string ("video/x-raw-rgb; video/x-raw-yuv");
+    if (in_plugin->capabilities & CODEC_CAP_HWACCEL_VDPAU)
+      srccaps = gst_caps_from_string ("video/x-vdpau-video");
+    else
+      srccaps = gst_caps_from_string ("video/x-raw-rgb; video/x-raw-yuv");
   } else {
     srccaps = gst_ffmpeg_codectype_to_audio_caps (NULL,
         in_plugin->id, FALSE, in_plugin);
@@ -336,7 +359,7 @@ gst_ffmpegdec_base_init (GstFFMpegDecClass * klass)
     GST_DEBUG ("Couldn't get source caps for decoder '%s'", in_plugin->name);
     srccaps = gst_caps_from_string ("unknown/unknown");
   }
-
+  
   /* pad templates */
   sinktempl = gst_pad_template_new ("sink", GST_PAD_SINK,
       GST_PAD_ALWAYS, sinkcaps);
@@ -606,6 +629,18 @@ gst_ffmpegdec_close (GstFFMpegDec * ffmpegdec)
   ffmpegdec->format.video.fps_n = -1;
   ffmpegdec->format.video.old_fps_n = -1;
   ffmpegdec->format.video.interlaced = FALSE;
+
+#ifdef HAVE_VDPAU
+  if (ffmpegdec->is_vdpau_dec) {
+    if (ffmpegdec->device) {
+      GstVdpDevice *device = ffmpegdec->device;
+
+      if (ffmpegdec->decoder != VDP_INVALID_HANDLE)
+        device->vdp_decoder_destroy (ffmpegdec->decoder);
+      g_object_unref (device);
+    }
+  }
+#endif
 }
 
 /* with LOCK */
@@ -688,6 +723,12 @@ gst_ffmpegdec_open (GstFFMpegDec * ffmpegdec)
   ffmpegdec->proportion = 0.0;
   ffmpegdec->earliest_time = -1;
 
+#ifdef HAVE_VDPAU
+  ffmpegdec->device = NULL;
+  ffmpegdec->decoder = VDP_INVALID_HANDLE;
+  ffmpegdec->decoder_max_refs = -1;
+#endif
+
   return TRUE;
 
   /* ERRORS */
@@ -736,7 +777,11 @@ gst_ffmpegdec_setcaps (GstPad * pad, GstCaps * caps)
   /* set buffer functions */
   ffmpegdec->context->get_buffer = gst_ffmpegdec_get_buffer;
   ffmpegdec->context->release_buffer = gst_ffmpegdec_release_buffer;
+#ifdef HAVE_VDPAU
+  ffmpegdec->context->draw_horiz_band = gst_ffmpegdec_draw_horiz_band;
+#else
   ffmpegdec->context->draw_horiz_band = NULL;
+#endif
 
   /* default is to let format decide if it needs a parser */
   ffmpegdec->turnoff_parser = FALSE;
@@ -824,6 +869,12 @@ gst_ffmpegdec_setcaps (GstPad * pad, GstCaps * caps)
      * outside of the memory. */
     ffmpegdec->context->flags |= CODEC_FLAG_EMU_EDGE;
   }
+#ifdef HAVE_VDPAU
+  if (oclass->in_plugin->capabilities & CODEC_CAP_HWACCEL_VDPAU)
+    ffmpegdec->is_vdpau_dec = TRUE;
+  else
+    ffmpegdec->is_vdpau_dec = FALSE;
+#endif
 
   /* for AAC we only use av_parse if not on raw caps */
   if (oclass->in_plugin->id == CODEC_ID_AAC) {
@@ -954,6 +1005,150 @@ alloc_failed:
   }
 }
 
+#ifdef HAVE_VDPAU
+static VdpDecoder
+create_vdpau_decoder (GstVdpDevice * device, enum PixelFormat pix_fmt,
+    guint max_refs, guint width, guint height)
+{
+  VdpDecoderProfile profile;
+  VdpStatus status;
+  VdpDecoder decoder;
+
+  switch (pix_fmt) {
+    case PIX_FMT_VDPAU_MPEG1:
+      profile = VDP_DECODER_PROFILE_MPEG1;
+      break;
+    case PIX_FMT_VDPAU_MPEG2:
+      profile = VDP_DECODER_PROFILE_MPEG2_MAIN;
+      break;
+    case PIX_FMT_VDPAU_H264:
+      profile = VDP_DECODER_PROFILE_H264_HIGH;
+      break;
+    case PIX_FMT_VDPAU_VC1:
+      profile = VDP_DECODER_PROFILE_VC1_ADVANCED;
+      break;
+    default:
+      GST_ERROR ("Invalid picture format");
+      return VDP_INVALID_HANDLE;
+  }
+
+  status = device->vdp_decoder_create (device->device, profile, width,
+      height, max_refs, &decoder);
+  if (status != VDP_STATUS_OK) {
+    GST_ERROR
+        ("Couldn't create vdpau decoder, error returned from vdpau was: %s",
+        device->vdp_get_error_string (status));
+    return VDP_INVALID_HANDLE;
+  }
+
+  return decoder;
+
+}
+
+static GstFlowReturn
+gst_ffmpegdec_vdpau_alloc_output_buffer (GstFFMpegDec * ffmpegdec,
+    GstBuffer ** outbuf)
+{
+  GstFlowReturn ret;
+
+  /* see if we need renegotiation */
+  if (G_UNLIKELY (!gst_ffmpegdec_negotiate (ffmpegdec, FALSE)))
+    goto negotiate_failed;
+
+  ret = gst_pad_alloc_buffer_and_set_caps (ffmpegdec->srcpad,
+      GST_BUFFER_OFFSET_NONE, 0, GST_PAD_CAPS (ffmpegdec->srcpad), outbuf);
+  if (G_UNLIKELY (ret != GST_FLOW_OK))
+    goto alloc_failed;
+
+  if (G_UNLIKELY (!ffmpegdec->device))
+    ffmpegdec->device = g_object_ref (((GstVdpVideoBuffer *) * outbuf)->device);
+
+  return ret;
+
+  /* special cases */
+negotiate_failed:
+  {
+    GST_ERROR_OBJECT (ffmpegdec, "negotiate failed");
+    return GST_FLOW_NOT_NEGOTIATED;
+  }
+alloc_failed:
+  {
+    GST_ERROR_OBJECT (ffmpegdec, "pad_alloc failed");
+    return ret;
+  }
+}
+
+static void
+gst_ffmpegdec_draw_horiz_band (AVCodecContext * context,
+    const AVFrame * picture, int offset[4], int y, int type, int height)
+{
+  GstFFMpegDec *ffmpegdec;
+
+  ffmpegdec = (GstFFMpegDec *) context->opaque;
+
+  if (ffmpegdec->is_vdpau_dec) {
+    GstVdpDevice *device;
+    struct vdpau_render_state *render;
+    guint max_refs;
+    guint width, height;
+    VdpStatus status;
+
+    device = ffmpegdec->device;
+    render = (struct vdpau_render_state *) picture->data[0];
+
+    width = ffmpegdec->context->width;
+    height = ffmpegdec->context->height;
+
+    if (ffmpegdec->context->pix_fmt == PIX_FMT_VDPAU_H264)
+      max_refs = render->info.h264.num_ref_frames;
+    else
+      max_refs = 2;
+
+    if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE)) {
+      ffmpegdec->decoder = create_vdpau_decoder (device,
+          ffmpegdec->context->pix_fmt, max_refs, width, height);
+
+      if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE))
+        goto create_decoder_failed;
+    } else if (G_UNLIKELY (max_refs != ffmpegdec->decoder_max_refs)) {
+      device->vdp_decoder_destroy (ffmpegdec->decoder);
+
+      ffmpegdec->decoder = create_vdpau_decoder (device,
+          ffmpegdec->context->pix_fmt, max_refs, width, height);
+
+      if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE))
+        goto create_decoder_failed;
+
+      ffmpegdec->decoder_max_refs = max_refs;
+    }
+
+    status = device->vdp_decoder_render (ffmpegdec->decoder, render->surface,
+        (void *) &render->info, render->bitstream_buffers_used,
+        render->bitstream_buffers);
+    if (status != VDP_STATUS_OK)
+      goto decode_failed;
+
+    return;
+
+  create_decoder_failed:
+    {
+      GST_ELEMENT_ERROR (ffmpegdec, RESOURCE, OPEN_READ,
+          ("Couldn't create vdpau decoder."), (NULL));
+      return;
+    }
+
+  decode_failed:
+    {
+      GST_ELEMENT_ERROR (ffmpegdec, RESOURCE, READ,
+          ("Could not decode"),
+          ("Error returned from vdpau was: %s",
+              device->vdp_get_error_string (status)));
+      return;
+    }
+  }
+}
+#endif
+
 static int
 gst_ffmpegdec_get_buffer (AVCodecContext * context, AVFrame * picture)
 {
@@ -984,6 +1179,24 @@ gst_ffmpegdec_get_buffer (AVCodecContext * context, AVFrame * picture)
 
   GST_LOG_OBJECT (ffmpegdec, "dimension %dx%d, coded %dx%d", width, height,
       coded_width, coded_height);
+
+#ifdef HAVE_VDPAU
+  if (ffmpegdec->is_vdpau_dec) {
+    GstFlowReturn ret;
+    struct vdpau_render_state *render;
+
+    ret = gst_ffmpegdec_vdpau_alloc_output_buffer (ffmpegdec, &buf);
+    if (G_UNLIKELY (ret != GST_FLOW_OK))
+      return -1;
+
+    render = g_new0 (struct vdpau_render_state, 1);
+    render->surface = GST_VDP_VIDEO_BUFFER (buf)->surface;
+    picture->data[0] = (void *) render;
+
+    goto beach;
+  }
+#endif
+
   if (!ffmpegdec->current_dr) {
     GST_LOG_OBJECT (ffmpegdec, "direct rendering disabled, fallback alloc");
     res = avcodec_default_get_buffer (context, picture);
@@ -1045,6 +1258,9 @@ gst_ffmpegdec_get_buffer (AVCodecContext * context, AVFrame * picture)
       break;
   }
 
+#ifdef HAVE_VDPAU
+beach:
+#endif
   /* tell ffmpeg we own this buffer, tranfer the ref we have on the buffer to
    * the opaque data. */
   picture->type = FF_BUFFER_TYPE_USER;
@@ -1091,6 +1307,11 @@ gst_ffmpegdec_release_buffer (AVCodecContext * context, AVFrame * picture)
   }
 #else
   gst_buffer_unref (buf);
+#endif
+
+#ifdef HAVE_VDPAU
+  if (ffmpegdec->is_vdpau_dec)
+    g_free (picture->data[0]);
 #endif
 
   /* zero out the reference in ffmpeg */
@@ -1567,6 +1788,7 @@ get_output_buffer (GstFFMpegDec * ffmpegdec, GstBuffer ** outbuf)
 
     av_picture_copy (&pic, outpic, ffmpegdec->context->pix_fmt, width, height);
   }
+
   ffmpegdec->picture->pts = -1;
 
   return ret;
@@ -2882,12 +3104,14 @@ gst_ffmpegdec_register (GstPlugin * plugin)
 
     /* No vdpau plugins until we can figure out how to properly use them
      * outside of ffmpeg. */
+#ifndef HAVE_VDPAU
     if (g_str_has_suffix (in_plugin->name, "_vdpau")) {
       GST_DEBUG
-          ("Ignoring VDPAU decoder %s. We can't handle this outside of ffmpeg",
+          ("Ignoring VDPAU decoder %s, since we don't have the vdpau plugins",
           in_plugin->name);
       goto next;
     }
+#endif
 
     if (g_str_has_suffix (in_plugin->name, "_xvmc")) {
       GST_DEBUG

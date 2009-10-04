@@ -28,6 +28,9 @@
 #else
 #include <libavcodec/avcodec.h>
 #endif
+#ifdef HAVE_VDPAU
+#include <vdpau/vdpau.h>
+#endif
 #include <string.h>
 
 #include "gstffmpeg.h"
@@ -1690,6 +1693,14 @@ gst_ffmpeg_pixfmt_to_caps (enum PixelFormat pix_fmt, AVCodecContext * context,
       caps = gst_ff_vid_caps_new (context, codec_id, "video/x-raw-gray",
           "bpp", G_TYPE_INT, bpp, "depth", G_TYPE_INT, depth, NULL);
       break;
+#ifdef HAVE_VDPAU
+    case PIX_FMT_VDPAU_H264:
+    case PIX_FMT_VDPAU_MPEG1:
+    case PIX_FMT_VDPAU_MPEG2:
+    case PIX_FMT_VDPAU_VC1:
+      caps = gst_caps_new_simple ("video/x-vdpau-video",
+          "chroma-type", G_TYPE_INT, VDP_CHROMA_TYPE_420, NULL);
+#endif
     default:
       /* give up ... */
       break;
