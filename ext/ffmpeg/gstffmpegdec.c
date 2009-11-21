@@ -33,6 +33,7 @@
 #ifdef HAVE_VDPAU
 #include <gst/vdpau/gstvdpdevice.h>
 #include <gst/vdpau/gstvdpvideobuffer.h>
+#include <gst/vdpau/gstvdpvideosrcpad.h>
 #include <vdpau/vdpau.h>
 #include "libavcodec/vdpau.h"
 #endif
@@ -174,7 +175,6 @@ struct _GstFFMpegDec
 
 #ifdef HAVE_VDPAU
   gboolean is_vdpau_dec;
-  GstVdpDevice *device;
   VdpDecoder decoder;
   gint decoder_max_refs;
 #endif
@@ -344,13 +344,17 @@ gst_ffmpegdec_base_init (GstFFMpegDecClass * klass)
   if (!sinkcaps) {
     GST_DEBUG ("Couldn't get sink caps for decoder '%s', skipping codec",
         in_plugin->name);
-    goto next;
+    srccaps = gst_caps_from_string ("unknown/unknown");
   }
   if (in_plugin->type == CODEC_TYPE_VIDEO) {
+#ifdef HAVE_VDPAU
     if (in_plugin->capabilities & CODEC_CAP_HWACCEL_VDPAU)
-      srccaps = gst_caps_from_string ("video/x-vdpau-video");
+      srccaps = gst_vdp_video_src_pad_get_template_caps ();
     else
       srccaps = gst_caps_from_string ("video/x-raw-rgb; video/x-raw-yuv");
+#else
+    srccaps = gst_caps_from_string ("video/x-raw-rgb; video/x-raw-yuv");
+#endif
   } else {
     srccaps = gst_ffmpeg_codectype_to_audio_caps (NULL,
         in_plugin->id, FALSE, in_plugin);
@@ -359,7 +363,7 @@ gst_ffmpegdec_base_init (GstFFMpegDecClass * klass)
     GST_DEBUG ("Couldn't get source caps for decoder '%s'", in_plugin->name);
     srccaps = gst_caps_from_string ("unknown/unknown");
   }
-  
+
   /* pad templates */
   sinktempl = gst_pad_template_new ("sink", GST_PAD_SINK,
       GST_PAD_ALWAYS, sinkcaps);
@@ -426,6 +430,14 @@ gst_ffmpegdec_init (GstFFMpegDec * ffmpegdec)
 
   oclass = (GstFFMpegDecClass *) (G_OBJECT_GET_CLASS (ffmpegdec));
 
+  /* check if it's a vdpau decoder */
+#ifdef HAVE_VDPAU
+  if (oclass->in_plugin->capabilities & CODEC_CAP_HWACCEL_VDPAU)
+    ffmpegdec->is_vdpau_dec = TRUE;
+  else
+    ffmpegdec->is_vdpau_dec = FALSE;
+#endif
+
   /* setup pads */
   ffmpegdec->sinkpad = gst_pad_new_from_template (oclass->sinktempl, "sink");
   gst_pad_set_setcaps_function (ffmpegdec->sinkpad,
@@ -436,6 +448,20 @@ gst_ffmpegdec_init (GstFFMpegDec * ffmpegdec)
       GST_DEBUG_FUNCPTR (gst_ffmpegdec_chain));
   gst_element_add_pad (GST_ELEMENT (ffmpegdec), ffmpegdec->sinkpad);
 
+#ifdef HAVE_VDPAU
+  if (ffmpegdec->is_vdpau_dec)
+    ffmpegdec->srcpad = (GstPad *) gst_vdp_video_src_pad_new ();
+  else {
+    ffmpegdec->srcpad = gst_pad_new_from_template (oclass->srctempl, "src");
+    gst_pad_use_fixed_caps (ffmpegdec->srcpad);
+  }
+
+  gst_pad_set_event_function (ffmpegdec->srcpad,
+      GST_DEBUG_FUNCPTR (gst_ffmpegdec_src_event));
+  gst_pad_set_query_function (ffmpegdec->srcpad,
+      GST_DEBUG_FUNCPTR (gst_ffmpegdec_query));
+  gst_element_add_pad (GST_ELEMENT (ffmpegdec), ffmpegdec->srcpad);
+#else
   ffmpegdec->srcpad = gst_pad_new_from_template (oclass->srctempl, "src");
   gst_pad_use_fixed_caps (ffmpegdec->srcpad);
   gst_pad_set_event_function (ffmpegdec->srcpad,
@@ -443,6 +469,7 @@ gst_ffmpegdec_init (GstFFMpegDec * ffmpegdec)
   gst_pad_set_query_function (ffmpegdec->srcpad,
       GST_DEBUG_FUNCPTR (gst_ffmpegdec_query));
   gst_element_add_pad (GST_ELEMENT (ffmpegdec), ffmpegdec->srcpad);
+#endif
 
   /* some ffmpeg data */
   ffmpegdec->context = avcodec_alloc_context ();
@@ -632,12 +659,13 @@ gst_ffmpegdec_close (GstFFMpegDec * ffmpegdec)
 
 #ifdef HAVE_VDPAU
   if (ffmpegdec->is_vdpau_dec) {
-    if (ffmpegdec->device) {
-      GstVdpDevice *device = ffmpegdec->device;
+    if (ffmpegdec->decoder != VDP_INVALID_HANDLE) {
+      GstVdpDevice *device =
+          gst_vdp_video_src_pad_get_device (GST_VDP_VIDEO_SRC_PAD
+          (ffmpegdec->srcpad));
 
-      if (ffmpegdec->decoder != VDP_INVALID_HANDLE)
+      if (device)
         device->vdp_decoder_destroy (ffmpegdec->decoder);
-      g_object_unref (device);
     }
   }
 #endif
@@ -724,7 +752,6 @@ gst_ffmpegdec_open (GstFFMpegDec * ffmpegdec)
   ffmpegdec->earliest_time = -1;
 
 #ifdef HAVE_VDPAU
-  ffmpegdec->device = NULL;
   ffmpegdec->decoder = VDP_INVALID_HANDLE;
   ffmpegdec->decoder_max_refs = -1;
 #endif
@@ -778,7 +805,10 @@ gst_ffmpegdec_setcaps (GstPad * pad, GstCaps * caps)
   ffmpegdec->context->get_buffer = gst_ffmpegdec_get_buffer;
   ffmpegdec->context->release_buffer = gst_ffmpegdec_release_buffer;
 #ifdef HAVE_VDPAU
-  ffmpegdec->context->draw_horiz_band = gst_ffmpegdec_draw_horiz_band;
+  if (ffmpegdec->is_vdpau_dec)
+    ffmpegdec->context->draw_horiz_band = gst_ffmpegdec_draw_horiz_band;
+  else
+    ffmpegdec->context->draw_horiz_band = NULL;
 #else
   ffmpegdec->context->draw_horiz_band = NULL;
 #endif
@@ -870,10 +900,10 @@ gst_ffmpegdec_setcaps (GstPad * pad, GstCaps * caps)
     ffmpegdec->context->flags |= CODEC_FLAG_EMU_EDGE;
   }
 #ifdef HAVE_VDPAU
-  if (oclass->in_plugin->capabilities & CODEC_CAP_HWACCEL_VDPAU)
-    ffmpegdec->is_vdpau_dec = TRUE;
-  else
-    ffmpegdec->is_vdpau_dec = FALSE;
+  if (ffmpegdec->is_vdpau_dec) {
+    ffmpegdec->context->slice_flags =
+        ffmpegdec->context->slice_flags | SLICE_FLAG_CODED_ORDER;
+  }
 #endif
 
   /* for AAC we only use av_parse if not on raw caps */
@@ -1055,34 +1085,18 @@ gst_ffmpegdec_vdpau_alloc_output_buffer (GstFFMpegDec * ffmpegdec,
   if (G_UNLIKELY (!gst_ffmpegdec_negotiate (ffmpegdec, FALSE)))
     goto negotiate_failed;
 
-  ret = gst_pad_alloc_buffer_and_set_caps (ffmpegdec->srcpad,
-      GST_BUFFER_OFFSET_NONE, 0, GST_PAD_CAPS (ffmpegdec->srcpad), outbuf);
+  ret = gst_vdp_video_src_pad_alloc_buffer (
+      (GstVdpVideoSrcPad *) ffmpegdec->srcpad, (GstVdpVideoBuffer **) outbuf);
   if (G_UNLIKELY (ret != GST_FLOW_OK))
-    goto alloc_failed;
-
-  if (G_UNLIKELY (!GST_IS_VDP_VIDEO_BUFFER (*outbuf)))
-    goto wrong_buffer;
-
-  if (G_UNLIKELY (!ffmpegdec->device))
-    ffmpegdec->device = g_object_ref (((GstVdpVideoBuffer *) * outbuf)->device);
+    return ret;
 
   return ret;
 
   /* special cases */
 negotiate_failed:
   {
-    GST_ERROR_OBJECT (ffmpegdec, "negotiate failed");
+    GST_DEBUG_OBJECT (ffmpegdec, "negotiate failed");
     return GST_FLOW_NOT_NEGOTIATED;
-  }
-alloc_failed:
-  {
-    GST_ERROR_OBJECT (ffmpegdec, "pad_alloc failed");
-    return ret;
-  }
-wrong_buffer:
-  {
-    GST_ERROR_OBJECT (ffmpegdec, "sink element returned wrong kindof buffer");
-    return GST_FLOW_NOT_LINKED;
   }
 }
 
@@ -1090,70 +1104,64 @@ static void
 gst_ffmpegdec_draw_horiz_band (AVCodecContext * context,
     const AVFrame * picture, int offset[4], int y, int type, int height)
 {
-  GstFFMpegDec *ffmpegdec;
+  GstFFMpegDec *ffmpegdec = (GstFFMpegDec *) context->opaque;
 
-  ffmpegdec = (GstFFMpegDec *) context->opaque;
+  GstVdpDevice *device;
+  struct vdpau_render_state *render;
+  guint max_refs;
+  guint width;
+  VdpStatus status;
 
-  if (ffmpegdec->is_vdpau_dec) {
-    GstVdpDevice *device;
-    struct vdpau_render_state *render;
-    guint max_refs;
-    guint width, height;
-    VdpStatus status;
+  device = gst_vdp_video_src_pad_get_device (
+      (GstVdpVideoSrcPad *) ffmpegdec->srcpad);
+  render = (struct vdpau_render_state *) picture->data[0];
 
-    device = ffmpegdec->device;
-    render = (struct vdpau_render_state *) picture->data[0];
+  width = ffmpegdec->context->width;
+  height = ffmpegdec->context->height;
 
-    width = ffmpegdec->context->width;
-    height = ffmpegdec->context->height;
+  if (ffmpegdec->context->pix_fmt == PIX_FMT_VDPAU_H264)
+    max_refs = render->info.h264.num_ref_frames;
+  else
+    max_refs = 2;
 
-    if (ffmpegdec->context->pix_fmt == PIX_FMT_VDPAU_H264)
-      max_refs = render->info.h264.num_ref_frames;
-    else
-      max_refs = 2;
+  if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE)) {
+    ffmpegdec->decoder = create_vdpau_decoder (device,
+        ffmpegdec->context->pix_fmt, max_refs, width, height);
 
-    if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE)) {
-      ffmpegdec->decoder = create_vdpau_decoder (device,
-          ffmpegdec->context->pix_fmt, max_refs, width, height);
+    if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE))
+      goto create_decoder_failed;
+  } else if (G_UNLIKELY (max_refs != ffmpegdec->decoder_max_refs)) {
+    device->vdp_decoder_destroy (ffmpegdec->decoder);
 
-      if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE))
-        goto create_decoder_failed;
-    } else if (G_UNLIKELY (max_refs != ffmpegdec->decoder_max_refs)) {
-      device->vdp_decoder_destroy (ffmpegdec->decoder);
+    ffmpegdec->decoder = create_vdpau_decoder (device,
+        ffmpegdec->context->pix_fmt, max_refs, width, height);
 
-      ffmpegdec->decoder = create_vdpau_decoder (device,
-          ffmpegdec->context->pix_fmt, max_refs, width, height);
+    if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE))
+      goto create_decoder_failed;
 
-      if (G_UNLIKELY (ffmpegdec->decoder == VDP_INVALID_HANDLE))
-        goto create_decoder_failed;
-
-      ffmpegdec->decoder_max_refs = max_refs;
-    }
-
-    status = device->vdp_decoder_render (ffmpegdec->decoder, render->surface,
-        (void *) &render->info, render->bitstream_buffers_used,
-        render->bitstream_buffers);
-    if (status != VDP_STATUS_OK)
-      goto decode_failed;
-
-    return;
-
-  create_decoder_failed:
-    {
-      GST_ELEMENT_ERROR (ffmpegdec, RESOURCE, OPEN_READ,
-          ("Couldn't create vdpau decoder."), (NULL));
-      return;
-    }
-
-  decode_failed:
-    {
-      GST_ELEMENT_ERROR (ffmpegdec, RESOURCE, READ,
-          ("Could not decode"),
-          ("Error returned from vdpau was: %s",
-              device->vdp_get_error_string (status)));
-      return;
-    }
+    ffmpegdec->decoder_max_refs = max_refs;
   }
+
+  status = device->vdp_decoder_render (ffmpegdec->decoder, render->surface,
+      (void *) &render->info, render->bitstream_buffers_used,
+      render->bitstream_buffers);
+  if (status != VDP_STATUS_OK)
+    goto decode_failed;
+
+  return;
+
+create_decoder_failed:
+  GST_ELEMENT_ERROR (ffmpegdec, RESOURCE, OPEN_READ,
+      ("Couldn't create vdpau decoder."), (NULL));
+  return;
+
+decode_failed:
+  GST_ELEMENT_ERROR (ffmpegdec, RESOURCE, READ,
+      ("Could not decode"),
+      ("Error returned from vdpau was: %s",
+          device->vdp_get_error_string (status)));
+  return;
+
 }
 #endif
 
@@ -1468,8 +1476,20 @@ gst_ffmpegdec_negotiate (GstFFMpegDec * ffmpegdec, gboolean force)
       break;
   }
 
+#ifdef HAVE_VDPAU
+  if (ffmpegdec->is_vdpau_dec) {
+    caps = gst_pad_get_allowed_caps (ffmpegdec->srcpad);
+    if (caps == NULL)
+      goto no_caps;
+
+    gst_pad_fixate_caps (ffmpegdec->srcpad, caps);
+  } else
+    caps = gst_ffmpeg_codectype_to_caps (oclass->in_plugin->type,
+        ffmpegdec->context, oclass->in_plugin->id, FALSE);
+#else
   caps = gst_ffmpeg_codectype_to_caps (oclass->in_plugin->type,
       ffmpegdec->context, oclass->in_plugin->id, FALSE);
+#endif
 
   if (caps == NULL)
     goto no_caps;
@@ -1513,8 +1533,19 @@ gst_ffmpegdec_negotiate (GstFFMpegDec * ffmpegdec, gboolean force)
       break;
   }
 
+#ifdef HAVE_VDPAU
+  if (ffmpegdec->is_vdpau_dec) {
+    if (!gst_vdp_video_src_pad_set_caps
+        (GST_VDP_VIDEO_SRC_PAD (ffmpegdec->srcpad), caps))
+      goto caps_failed;
+  } else {
+    if (!gst_pad_set_caps (ffmpegdec->srcpad, caps))
+      goto caps_failed;
+  }
+#else
   if (!gst_pad_set_caps (ffmpegdec->srcpad, caps))
     goto caps_failed;
+#endif
 
   gst_caps_unref (caps);
 
@@ -1833,7 +1864,15 @@ flush_queued (GstFFMpegDec * ffmpegdec)
         GST_TIME_ARGS (GST_BUFFER_DURATION (buf)));
 
     /* iterate ouput queue an push downstream */
+#ifdef HAVE_VDPAU
+    if (ffmpegdec->is_vdpau_dec)
+      res = gst_vdp_video_src_pad_push (
+          (GstVdpVideoSrcPad *) ffmpegdec->srcpad, (GstVdpVideoBuffer *) buf);
+    else
+      res = gst_pad_push (ffmpegdec->srcpad, buf);
+#else
     res = gst_pad_push (ffmpegdec->srcpad, buf);
+#endif
 
     ffmpegdec->queued =
         g_list_delete_link (ffmpegdec->queued, ffmpegdec->queued);
@@ -2515,8 +2554,16 @@ gst_ffmpegdec_frame (GstFFMpegDec * ffmpegdec,
     gst_buffer_set_caps (outbuf, GST_PAD_CAPS (ffmpegdec->srcpad));
 
     if (ffmpegdec->segment.rate > 0.0) {
-      /* and off we go */
+#ifdef HAVE_VDPAU
+      if (ffmpegdec->is_vdpau_dec)
+        *ret = gst_vdp_video_src_pad_push (
+            (GstVdpVideoSrcPad *) ffmpegdec->srcpad,
+            (GstVdpVideoBuffer *) outbuf);
+      else
+        *ret = gst_pad_push (ffmpegdec->srcpad, outbuf);
+#else
       *ret = gst_pad_push (ffmpegdec->srcpad, outbuf);
+#endif
     } else {
       /* reverse playback, queue frame till later when we get a discont. */
       GST_DEBUG_OBJECT (ffmpegdec, "queued frame");
