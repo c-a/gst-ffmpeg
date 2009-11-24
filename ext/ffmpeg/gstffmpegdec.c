@@ -344,12 +344,12 @@ gst_ffmpegdec_base_init (GstFFMpegDecClass * klass)
   if (!sinkcaps) {
     GST_DEBUG ("Couldn't get sink caps for decoder '%s', skipping codec",
         in_plugin->name);
-    srccaps = gst_caps_from_string ("unknown/unknown");
+    sinkcaps = gst_caps_from_string ("unknown/unknown");
   }
   if (in_plugin->type == CODEC_TYPE_VIDEO) {
 #ifdef HAVE_VDPAU
     if (in_plugin->capabilities & CODEC_CAP_HWACCEL_VDPAU)
-      srccaps = gst_vdp_video_src_pad_get_template_caps ();
+      srccaps = gst_vdp_video_buffer_get_caps (TRUE, VDP_CHROMA_TYPE_420);
     else
       srccaps = gst_caps_from_string ("video/x-raw-rgb; video/x-raw-yuv");
 #else
@@ -450,7 +450,9 @@ gst_ffmpegdec_init (GstFFMpegDec * ffmpegdec)
 
 #ifdef HAVE_VDPAU
   if (ffmpegdec->is_vdpau_dec)
-    ffmpegdec->srcpad = (GstPad *) gst_vdp_video_src_pad_new ();
+    ffmpegdec->srcpad = (GstPad *)
+        gst_vdp_video_src_pad_new (gst_pad_template_get_caps
+        (oclass->srctempl));
   else {
     ffmpegdec->srcpad = gst_pad_new_from_template (oclass->srctempl, "src");
     gst_pad_use_fixed_caps (ffmpegdec->srcpad);
