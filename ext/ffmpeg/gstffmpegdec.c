@@ -247,6 +247,8 @@ static gboolean gst_ffmpegdec_negotiate (GstFFMpegDec * ffmpegdec,
 #ifdef HAVE_VDPAU
 static void gst_ffmpegdec_draw_horiz_band (AVCodecContext * context,
     const AVFrame * picture, int offset[4], int y, int type, int height);
+static enum PixelFormat gst_ffmpegdec_get_format (struct AVCodecContext *s,
+    const enum PixelFormat *fmt);
 #endif
 
 /* some sort of bufferpool handling, but different */
@@ -451,8 +453,7 @@ gst_ffmpegdec_init (GstFFMpegDec * ffmpegdec)
 #ifdef HAVE_VDPAU
   if (ffmpegdec->is_vdpau_dec)
     ffmpegdec->srcpad = (GstPad *)
-        gst_vdp_video_src_pad_new (gst_pad_template_get_caps
-        (oclass->srctempl));
+        gst_vdp_video_src_pad_new (oclass->srctempl, "src");
   else {
     ffmpegdec->srcpad = gst_pad_new_from_template (oclass->srctempl, "src");
     gst_pad_use_fixed_caps (ffmpegdec->srcpad);
@@ -807,9 +808,10 @@ gst_ffmpegdec_setcaps (GstPad * pad, GstCaps * caps)
   ffmpegdec->context->get_buffer = gst_ffmpegdec_get_buffer;
   ffmpegdec->context->release_buffer = gst_ffmpegdec_release_buffer;
 #ifdef HAVE_VDPAU
-  if (ffmpegdec->is_vdpau_dec)
+  if (ffmpegdec->is_vdpau_dec) {
     ffmpegdec->context->draw_horiz_band = gst_ffmpegdec_draw_horiz_band;
-  else
+    ffmpegdec->context->get_format = gst_ffmpegdec_get_format;
+  } else
     ffmpegdec->context->draw_horiz_band = NULL;
 #else
   ffmpegdec->context->draw_horiz_band = NULL;
@@ -1116,6 +1118,12 @@ gst_ffmpegdec_draw_horiz_band (AVCodecContext * context,
 
   device = gst_vdp_video_src_pad_get_device (
       (GstVdpVideoSrcPad *) ffmpegdec->srcpad);
+
+  /* check if we've got a device since if we're in GST_STATE_NULL
+   * we don't have any device available */
+  if (!device)
+    return;
+
   render = (struct vdpau_render_state *) picture->data[0];
 
   width = ffmpegdec->context->width;
@@ -1165,6 +1173,13 @@ decode_failed:
   return;
 
 }
+
+static enum PixelFormat
+gst_ffmpegdec_get_format (struct AVCodecContext *s, const enum PixelFormat *fmt)
+{
+  return fmt[0];
+}
+
 #endif
 
 static int
@@ -1481,10 +1496,15 @@ gst_ffmpegdec_negotiate (GstFFMpegDec * ffmpegdec, gboolean force)
 #ifdef HAVE_VDPAU
   if (ffmpegdec->is_vdpau_dec) {
     caps = gst_pad_get_allowed_caps (ffmpegdec->srcpad);
-    if (caps == NULL)
-      goto no_caps;
+    if (caps == NULL) {
+      caps = gst_pad_get_caps (ffmpegdec->srcpad);
+      if (caps == NULL)
+        goto no_caps;
+    }
 
     gst_pad_fixate_caps (ffmpegdec->srcpad, caps);
+    gst_caps_set_simple (caps, "width", G_TYPE_INT, ffmpegdec->context->width,
+        "height", G_TYPE_INT, ffmpegdec->context->height, NULL);
   } else
     caps = gst_ffmpeg_codectype_to_caps (oclass->in_plugin->type,
         ffmpegdec->context, oclass->in_plugin->id, FALSE);
@@ -1506,6 +1526,7 @@ gst_ffmpegdec_negotiate (GstFFMpegDec * ffmpegdec, gboolean force)
       height = ffmpegdec->format.video.clip_height;
       interlaced = ffmpegdec->format.video.interlaced;
 
+      GST_DEBUG ("width: %d", width);
       if (width != -1 && height != -1) {
         /* overwrite the output size with the dimension of the
          * clipping region but only if they are smaller. */
@@ -2551,9 +2572,16 @@ gst_ffmpegdec_frame (GstFFMpegDec * ffmpegdec,
       GST_BUFFER_FLAG_SET (outbuf, GST_BUFFER_FLAG_DISCONT);
       ffmpegdec->discont = FALSE;
     }
+#ifdef HAVE_VDPAU
+    /* FIXME: can't use gst_buffer_make_metadata_writable since we use
+     * a GstBuffer subclass */
+    gst_caps_replace (&GST_BUFFER_CAPS (outbuf),
+        GST_PAD_CAPS (ffmpegdec->srcpad));
+#else
     /* set caps */
     outbuf = gst_buffer_make_metadata_writable (outbuf);
     gst_buffer_set_caps (outbuf, GST_PAD_CAPS (ffmpegdec->srcpad));
+#endif
 
     if (ffmpegdec->segment.rate > 0.0) {
 #ifdef HAVE_VDPAU
