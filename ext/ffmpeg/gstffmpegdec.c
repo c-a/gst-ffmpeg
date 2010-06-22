@@ -663,11 +663,13 @@ gst_ffmpegdec_close (GstFFMpegDec * ffmpegdec)
 #ifdef HAVE_VDPAU
   if (ffmpegdec->is_vdpau_dec) {
     if (ffmpegdec->decoder != VDP_INVALID_HANDLE) {
-      GstVdpDevice *device =
-          gst_vdp_video_src_pad_get_device (GST_VDP_VIDEO_SRC_PAD
-          (ffmpegdec->srcpad));
+      GstFlowReturn ret;
+      GstVdpDevice *device;
 
-      if (device)
+      ret = gst_vdp_video_src_pad_get_device (GST_VDP_VIDEO_SRC_PAD
+          (ffmpegdec->srcpad), &device, NULL);
+
+      if (ret == GST_FLOW_OK)
         device->vdp_decoder_destroy (ffmpegdec->decoder);
     }
   }
@@ -1110,18 +1112,19 @@ gst_ffmpegdec_draw_horiz_band (AVCodecContext * context,
 {
   GstFFMpegDec *ffmpegdec = (GstFFMpegDec *) context->opaque;
 
+  GstFlowReturn ret;
   GstVdpDevice *device;
   struct vdpau_render_state *render;
   guint max_refs;
   guint width;
   VdpStatus status;
 
-  device = gst_vdp_video_src_pad_get_device (
-      (GstVdpVideoSrcPad *) ffmpegdec->srcpad);
+  ret = gst_vdp_video_src_pad_get_device (
+      (GstVdpVideoSrcPad *) ffmpegdec->srcpad, &device, NULL);
 
   /* check if we've got a device since if we're in GST_STATE_NULL
    * we don't have any device available */
-  if (!device)
+  if (ret != GST_FLOW_OK)
     return;
 
   render = (struct vdpau_render_state *) picture->data[0];
@@ -1556,19 +1559,8 @@ gst_ffmpegdec_negotiate (GstFFMpegDec * ffmpegdec, gboolean force)
       break;
   }
 
-#ifdef HAVE_VDPAU
-  if (ffmpegdec->is_vdpau_dec) {
-    if (!gst_vdp_video_src_pad_set_caps
-        (GST_VDP_VIDEO_SRC_PAD (ffmpegdec->srcpad), caps))
-      goto caps_failed;
-  } else {
-    if (!gst_pad_set_caps (ffmpegdec->srcpad, caps))
-      goto caps_failed;
-  }
-#else
   if (!gst_pad_set_caps (ffmpegdec->srcpad, caps))
     goto caps_failed;
-#endif
 
   gst_caps_unref (caps);
 
